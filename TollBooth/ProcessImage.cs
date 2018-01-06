@@ -1,40 +1,53 @@
 using System;
 using System.IO;
+using System.Net.Http;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.EventGrid;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.WindowsAzure.Storage.Blob;
+using TollBooth.Models;
 
 namespace TollBooth
 {
     public static class ProcessImage
     {
-        static string storageAccountConnectionString = System.Environment.GetEnvironmentVariable("myBlobStorage_STORAGE");
+        public static HttpClient _client;
 
         [FunctionName("ProcessImage")]
-        public static async Task Run(EventGridEvent uploadEvent, Stream incomingPlate, TraceWriter log)
+        public static async Task Run([BlobTrigger("images/{name}", Connection = "blobStorageConnection")]Stream incomingPlate, string name, TraceWriter log)
         {
             string licensePlateText = string.Empty;
-            log.Info(uploadEvent.ToString());
+            // Reuse the HttpClient across calls as much as possible so as not to exhaust all available sockets on the server on which it runs.
+            _client = _client ?? new HttpClient();
 
-            // Get the name of the uploaded image from the event's data.
-            var imageName = GetBlobNameFromUrl((string) uploadEvent.Data["url"]);
-            // Convert the incoming image stream to a byte array.
-            using (var br = new BinaryReader(incomingPlate))
+            log.Info($"Processing {name}");
+
+            try
             {
-                var licensePlateImage = br.ReadBytes((int)incomingPlate.Length);
-                licensePlateText = await new FindLicensePlateText().GetLicensePlate(licensePlateImage);
+                byte[] licensePlateImage;
+                // Convert the incoming image stream to a byte array.
+                using (var br = new BinaryReader(incomingPlate))
+                {
+                    licensePlateImage = br.ReadBytes((int)incomingPlate.Length);
+                }
+                // TODO 1: Set the licensePlateText value by awaiting a new FindLicensePlateText.GetLicensePlate method.
+                // COMPLETE: licensePlateText = await new.....
+
+                // Send the details to Event Grid.
+                await new SendToEventGrid(log, _client).SendLicensePlateData(new LicensePlateData()
+                {
+                    FileName = name,
+                    LicensePlateText = licensePlateText,
+                    TimeStamp = DateTime.UtcNow
+                });
+            }
+            catch (Exception e)
+            {
+                log.Error(e.Message);
             }
 
-            // Send the details to Event Grid.
-        }
-
-        private static string GetBlobNameFromUrl(string bloblUrl)
-        {
-            var myUri = new Uri(bloblUrl);
-            var myCloudBlob = new CloudBlob(myUri);
-            return myCloudBlob.Name;
+            log.Info($"Finished processing. Detected the following license plate: {licensePlateText}");
         }
     }
 }

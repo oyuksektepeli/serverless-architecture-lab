@@ -43,8 +43,8 @@ namespace TollBooth
             const string requestParameters = "language=unk&detectOrientation=true";
             // Get the API URL and the API key from settings.
             // TODO 2: Populate the below two variables with the correct AppSettings properties.
-            var uriBase = ConfigurationManager.AppSettings[""];
-            var apiKey = ConfigurationManager.AppSettings[""];
+            var uriBase = ConfigurationManager.AppSettings["computerVisionApiUrl"];
+            var apiKey = ConfigurationManager.AppSettings["computerVisionApiKey"];
 
             var resiliencyStrategy = DefineAndRetrieveResiliencyStrategy();
 
@@ -56,15 +56,11 @@ namespace TollBooth
 
             // Assemble the URI for the REST API Call.
             var uri = uriBase + "?" + requestParameters;
-            var content = new ByteArrayContent(imageBytes);
 
             try
             {
-                // Add application/octet-stream header for the content.
-                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-
                 // Execute the REST API call, implementing our resiliency strategy.
-                HttpResponseMessage response = await resiliencyStrategy.ExecuteAsync(() => _client.PostAsync(uri, content));
+                HttpResponseMessage response = await resiliencyStrategy.ExecuteAsync(() => _client.PostAsync(uri, GetImageHttpContent(imageBytes)));
 
                 // Get the JSON response.
                 var result = await response.Content.ReadAsAsync<OCRResult>();
@@ -82,6 +78,30 @@ namespace TollBooth
             _log.Info($"Finished OCR request. Result: {licensePlate}");
 
             return licensePlate;
+        }
+
+        /// <summary>
+        /// Request the ByteArrayContent object through a static method so
+        /// it is not disposed when the Polly resiliency policy asynchronously
+        /// executes our method that posts the image content to the Computer
+        /// Vision API. Otherwise, we'll receive the following error when the
+        /// API service is throttled:
+        /// System.ObjectDisposedException: Cannot access a disposed object. Object name: 'System.Net.Http.ByteArrayContent'
+        /// 
+        /// More information can be found on the HttpClient class in the
+        /// .NET Core library source code:
+        /// https://github.com/dotnet/corefx/blob/6d7fca5aecc135b97aeb3f78938a6afee55b1b5d/src/System.Net.Http/src/System/Net/Http/HttpClient.cs#L500
+        /// </summary>
+        /// <param name="imageBytes"></param>
+        /// <returns></returns>
+        private static ByteArrayContent GetImageHttpContent(byte[] imageBytes)
+        {
+            var content = new ByteArrayContent(imageBytes);
+
+            // Add application/octet-stream header for the content.
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+            return content;
         }
 
         /// <summary>
@@ -142,21 +162,17 @@ namespace TollBooth
         /// Creates a Polly-based resiliency strategy that does the following when communicating
         /// with the external (downstream) Computer Vision API service:
         /// 
-        /// If an Http response message is returned that should immediately cause a failure without
-        /// retrying (400, 401, 403), immediately stop attempting to contact the service and log the error.
-        /// This is implemented through the Circuit Breaker policy named 'circuitBreakerPolicyForUnrecoverable'.
-        /// 
         /// If requests to the service are being throttled, as indicated by 429 or 503 responses,
         /// wait and try again in a bit by exponentially backing off each time. This should give the service
         /// enough time to recover or allow enough time to pass that removes the throttling restriction.
         /// This is implemented through the WaitAndRetry policy named 'waitAndRetryPolicy'.
         /// 
-        /// Finally, if requests to the service result in an HttpResponseException, or a number of
+        /// Alternately, if requests to the service result in an HttpResponseException, or a number of
         /// status codes worth retrying (such as 500, 502, or 504), break the circuit to block any more
         /// requests for the specified period of time, send a test request to see if the error is still
         /// occurring, then reset the circuit once successful.
         /// 
-        /// All of these policies are executed through a PolicyWrap, which combines these into a resiliency
+        /// These policies are executed through a PolicyWrap, which combines these into a resiliency
         /// strategy. For more information, see: https://github.com/App-vNext/Polly/wiki/PolicyWrap
         /// 
         /// NOTE: A longer-term resiliency strategy would have us share the circuit breaker state across
@@ -184,8 +200,9 @@ namespace TollBooth
 
             // Define our waitAndRetry policy: retry n times with an exponential backoff in case the Computer Vision API throttles us for too many requests.
             var waitAndRetryPolicy = Policy
-                .HandleResult<HttpResponseMessage>(e => e.StatusCode == HttpStatusCode.ServiceUnavailable ||
-                    e.StatusCode == (System.Net.HttpStatusCode)429)
+                .Handle<HttpRequestException>()
+                .OrResult<HttpResponseMessage>(e => e.StatusCode == HttpStatusCode.ServiceUnavailable ||
+                    e.StatusCode == (System.Net.HttpStatusCode)429 || e.StatusCode == (System.Net.HttpStatusCode)403)
                 .WaitAndRetryAsync(10, // Retry 10 times with a delay between retries before ultimately giving up
                     attempt => TimeSpan.FromSeconds(0.25 * Math.Pow(2, attempt)), // Back off!  2, 4, 8, 16 etc times 1/4-second
                                                                                   //attempt => TimeSpan.FromSeconds(6), // Wait 6 seconds between retries
@@ -212,24 +229,8 @@ namespace TollBooth
                     onHalfOpen: () => _log.Info("Polly Circuit Breaker logging: Half-open: Next call is a trial")
                 );
 
-            // Define our second CircuitBreaker policy: Immediately break if encountered.
-            // This is designed to handle a number of unrecoverable status messages, such as 400, 401, and 403.
-            var circuitBreakerPolicyForUnrecoverable = Policy
-                .HandleResult<HttpResponseMessage>(r => httpStatusCodesToImmediatelyFail.Contains(r.StatusCode))
-                .CircuitBreakerAsync(
-                    handledEventsAllowedBeforeBreaking: 1,
-                    durationOfBreak: TimeSpan.MaxValue,
-                    onBreak: (outcome, breakDelay) =>
-                    {
-                        _log.Info($"Polly Circuit Breaker logging: Unrecoverable Http status encountered when calling the Computer Vision API: {outcome.Result.StatusCode}");
-                    },
-                    onReset: () => _log.Info("Polly Circuit Breaker logging: Call ok... closed the circuit again"),
-                    onHalfOpen: () => _log.Info("Polly Circuit Breaker logging: Half-open: Next call is a trial")
-                );
-
-            // Combine the waitAndRetryPolicy and circuit breaker policies into a PolicyWrap. This defines our resiliency strategy.
-            return Policy.WrapAsync(circuitBreakerPolicyForUnrecoverable, waitAndRetryPolicy, circuitBreakerPolicyForRecoverable);
+            // Combine the waitAndRetryPolicy and circuit breaker policy into a PolicyWrap. This defines our resiliency strategy.
+            return Policy.WrapAsync(waitAndRetryPolicy, circuitBreakerPolicyForRecoverable);
         }
     }
-
 }

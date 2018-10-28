@@ -33,6 +33,7 @@ namespace TollBooth
                 }
                 // TODO 1: Set the licensePlateText value by awaiting a new FindLicensePlateText.GetLicensePlate method.
                 // COMPLETE: licensePlateText = await new.....
+                licensePlateText = await new FindLicensePlateText(log, _client).GetLicensePlate(licensePlateImage);
 
                 // Send the details to Event Grid.
                 await new SendToEventGrid(log, _client).SendLicensePlateData(new LicensePlateData()
